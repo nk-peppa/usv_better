@@ -1,17 +1,19 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 
 namespace {
 
 struct MapperConfig {
 	int pwm_period_ns = 20000000;
-	int duty_neutral_ns = 1500000;
-	int duty_span_ns = 500000;
+	int duty_neutral_ns = 0;
+	int duty_span_ns = 5000000;
 
 	float max_power_percent = 70.0f;
 	float left_gain = 1.0f;
@@ -45,8 +47,8 @@ public:
 		float right = in.right_percent;
 
 		const float limit = std::max(0.0f, std::min(100.0f, cfg_.max_power_percent));
-		left = clamp(left, -limit, limit);
-		right = clamp(right, -limit, limit);
+		left = clamp(left, 0.0f, limit);
+		right = clamp(right, 0.0f, limit);
 
 		left = left * cfg_.left_gain + cfg_.left_trim;
 		right = right * cfg_.right_gain + cfg_.right_trim;
@@ -72,8 +74,8 @@ private:
 		const float ratio = percent / 100.0f;
 		const float duty = static_cast<float>(cfg_.duty_neutral_ns) +
 						   ratio * static_cast<float>(cfg_.duty_span_ns);
-		const int min_duty = cfg_.duty_neutral_ns - cfg_.duty_span_ns;
-		const int max_duty = cfg_.duty_neutral_ns + cfg_.duty_span_ns;
+		const int min_duty = 0;
+		const int max_duty = std::max(0, cfg_.pwm_period_ns - 1);
 		return static_cast<int>(std::round(clamp(duty, static_cast<float>(min_duty),
 												 static_cast<float>(max_duty))));
 	}
@@ -108,13 +110,20 @@ public:
 
 private:
 	static bool writeInt(const std::string& path, int value) {
-		std::ofstream file(path);
-		if (!file.is_open()) {
-			std::cerr << "ERR: open failed: " << path << std::endl;
-			return false;
+		for (int i = 0; i < 3; ++i) {
+			std::ofstream file(path);
+			if (!file.is_open()) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(10));
+				continue;
+			}
+			file << value << '\n';
+			if (file.good()) {
+				return true;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
-		file << value << '\n';
-		return file.good();
+		std::cerr << "ERR: write failed: " << path << ", value=" << value << std::endl;
+		return false;
 	}
 
 	std::string left_duty_path_;
@@ -130,9 +139,9 @@ void printUsage() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
 	MapperConfig cfg;
-	cfg.max_power_percent = 70.0f;
+	cfg.max_power_percent = 100.0f;
 	cfg.left_gain = 1.0f;
 	cfg.right_gain = 0.98f;
 	cfg.left_trim = 0.0f;
@@ -146,6 +155,28 @@ int main() {
 		"/sys/class/pwm/pwmchip0/pwm1/duty_cycle",
 		"/sys/class/pwm/pwmchip0/pwm2/duty_cycle",
 		dry_run);
+
+	auto run_once = [&](float left, float right) {
+		ThrusterInput in;
+		in.left_percent = left;
+		in.right_percent = right;
+
+		const ThrusterOutput out = mapper.apply(in);
+		const bool ok = writer.writeDuty(out.left_duty_ns, out.right_duty_ns);
+		std::cout << std::fixed << std::setprecision(2)
+				  << "left=" << out.left_percent_final
+				  << "%, right=" << out.right_percent_final
+				  << "%, status=" << (ok ? 0 : 1) << std::endl;
+		return ok ? 0 : 1;
+	};
+
+	if (argc == 3) {
+		const float left = std::stof(argv[1]);
+		const float right = std::stof(argv[2]);
+		const int rc = run_once(left, right);
+		writer.writeDuty(0, 0);
+		return rc;
+	}
 
 	printUsage();
 	std::string line;
@@ -162,16 +193,7 @@ int main() {
 			continue;
 		}
 
-		ThrusterInput in;
-		in.left_percent = left;
-		in.right_percent = right;
-
-		const ThrusterOutput out = mapper.apply(in);
-		const bool ok = writer.writeDuty(out.left_duty_ns, out.right_duty_ns);
-		std::cout << std::fixed << std::setprecision(2)
-				  << "left=" << out.left_percent_final
-				  << "%, right=" << out.right_percent_final
-				  << "%, status=" << (ok ? 0 : 1) << std::endl;
+		run_once(left, right);
 	}
 
 	// Fail-safe stop on exit.

@@ -12,7 +12,7 @@ Current focus is Step3 gateway extension on top of Step2:
 - `CommunicationLayer.cc`: short-frame communication parser/ack demo
 - `MainProcessor.cc`: processing layer parser/dispatcher demo
 - `SlamExecutionLayer.h/.cc`: dedicated hub-to-SLAM execution bridge + RGB row preprocessing
-- `TrusterAcuator.cc`: actuator mapping/output demo
+- `TrusterAcuator.cc`: actuator mapping/output demo (PR refresh)
 - `tools/thruster_test_runner.sh`: single-file PWM validation entrypoint for dry-run and hardware sysfs writeout
 
 ## Build

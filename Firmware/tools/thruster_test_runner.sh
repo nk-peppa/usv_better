@@ -24,6 +24,26 @@ sysfs_write() {
   return 1
 }
 
+ensure_pwm_exported() {
+  local channel="$1"
+  local pwm_dir="$2"
+  local retries="${3:-5}"
+  local i
+  if [[ -d "$pwm_dir" ]]; then
+    return 0
+  fi
+
+  # Export may transiently fail (e.g. EBUSY race); retry and re-check directory.
+  for ((i=1; i<=retries; i++)); do
+    sysfs_write "$PWM_CHIP_DIR/export" "$channel" || true
+    sleep 0.1
+    if [[ -d "$pwm_dir" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 clamp_duty_to_period() {
   local duty="$1"
   awk -v d="$duty" -v p="$PERIOD_NS" 'BEGIN {
@@ -97,25 +117,22 @@ if [[ $HW_MODE -eq 1 ]]; then
     echo "PWM chip directory not found: $PWM_CHIP_DIR" >&2
     exit 3
   fi
-  if [[ ! -d "$PWM1_DIR" ]]; then
-    sysfs_write "$PWM_CHIP_DIR/export" "1"
-    sleep 0.1
-  fi
-  if [[ ! -d "$PWM2_DIR" ]]; then
-    sysfs_write "$PWM_CHIP_DIR/export" "2"
-    sleep 0.1
-  fi
+  ensure_pwm_exported "1" "$PWM1_DIR" || { echo "Failed to export pwm1." >&2; exit 4; }
+  ensure_pwm_exported "2" "$PWM2_DIR" || { echo "Failed to export pwm2." >&2; exit 4; }
   if [[ ! -d "$PWM1_DIR" || ! -d "$PWM2_DIR" ]]; then
     echo "Failed to export pwm channels or they do not appear." >&2
     ls -la "$PWM_CHIP_DIR"
     exit 4
   fi
-  sysfs_write "$PWM1_DIR/period" "$PERIOD_NS"
+  # Some PWM drivers require disable before period updates.
+  sysfs_write "$PWM1_DIR/enable" "0" || true
   sysfs_write "$PWM1_DIR/duty_cycle" "0"
+  sysfs_write "$PWM1_DIR/period" "$PERIOD_NS"
   sysfs_write "$PWM1_DIR/enable" "1"
 
-  sysfs_write "$PWM2_DIR/period" "$PERIOD_NS"
+  sysfs_write "$PWM2_DIR/enable" "0" || true
   sysfs_write "$PWM2_DIR/duty_cycle" "0"
+  sysfs_write "$PWM2_DIR/period" "$PERIOD_NS"
   sysfs_write "$PWM2_DIR/enable" "1"
 fi
 
