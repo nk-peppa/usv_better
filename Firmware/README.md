@@ -4,13 +4,13 @@
 This workspace contains a lightweight three-layer demo for USV edge validation.
 Current focus is the gateway/processor/SLAM-executor contract:
 - Communication layer exposes a TCP listener and parses/forwards normalized frames.
-- Communication layer forwards supported realtime/config/SLI frames and gateway management commands.
+- Communication layer forwards supported realtime/config/SLI frames to a persistent processor subprocess and handles gateway management commands locally.
 - Main processor owns control, SLAM ingest gating, D435i capture orchestration, fusion semantics, health, and rollback signals.
 - SLAM executor bridge uses Intel RealSense D435i capture by default and also includes an explicit mock D435i mode for local smoke testing.
 
 ## Files
-- `CommunicationLayer.cc`: TCP gateway adapter demo with line-oriented protocol handling and gateway management commands.
-- `MainProcessor.cc`: processing layer parser/dispatcher demo, D435i capture orchestration, health output, and `--d435i-selftest` entrypoint.
+- `CommunicationLayer.cc`: TCP gateway adapter with line-oriented protocol handling, gateway management commands, and a persistent `MainProcessor` subprocess bridge.
+- `MainProcessor.cc`: processing layer parser/dispatcher, D435i capture orchestration, health output, `--stdio` gateway-bridge mode, and `--d435i-selftest` entrypoint.
 - `SlamExecutionLayer.h/.cc`: hub-to-SLAM execution bridge, RealSense D435i capture bridge, mock D435i bridge, RGB/depth/gyro row feature enrichment.
 - `SelD435iSmokeTest.cc`: 10-second D435i smoke test with `--mock`/`+mock` support.
 - `TrusterAcuator.cc`: existing actuator mapping/output demo and dry-run sysfs PWM writer. The file name is historical.
@@ -21,7 +21,7 @@ Current focus is the gateway/processor/SLAM-executor contract:
 
 The SLAM execution path includes `<librealsense2/rs.hpp>` and links against Intel RealSense (`librealsense2`). Install the RealSense headers/library before building targets that include `SlamExecutionLayer.cc` or `SlamExecutionLayer.h`.
 
-Targets that only build `CommunicationLayer.cc` or `TrusterAcuator.cc` do not require RealSense.
+Targets that only build `CommunicationLayer.cc` or `TrusterAcuator.cc` do not require RealSense. Production gateway forwarding still requires a runnable processor command, typically `./main_processor_demo --stdio`, which does require RealSense for the current SLAM executor build.
 
 ## Build
 
@@ -40,20 +40,30 @@ If your RealSense installation is not in a default compiler search path, add the
 
 ### Communication gateway
 
-Run the communication layer with:
+Run the communication layer with a processor subprocess available:
 
 ```bash
 ./communication_layer_demo
+USV_PROCESSOR_CMD='./main_processor_demo --stdio' ./communication_layer_demo
+./communication_layer_demo --processor-cmd './main_processor_demo --stdio'
 ```
 
 It listens on `0.0.0.0`. The default port is `19520`; if unavailable, it tries fallback ports in this order: `9773`, `11514`, `23758`, `52019`.
 
+By default the gateway launches `./main_processor_demo --stdio` as a persistent child process, writes each normalized command to the child stdin, waits up to `route_timeout_ms` for one response line from child stdout, validates ACK format/sequence, and then returns the gateway ACK to the TCP client. If the child times out, the gateway terminates it to avoid stale ACKs being matched to later commands.
+
 ### Main processor
 
-Run the processor in stdin/stdout mode with:
+Run the processor in interactive stdin/stdout mode with:
 
 ```bash
 ./main_processor_demo
+```
+
+Run the processor in gateway bridge mode with ACK/HEALTH responses only on stdout and diagnostic/downlink logs on stderr:
+
+```bash
+./main_processor_demo --stdio
 ```
 
 The `SLI` processing path attempts D435i capture through the SLAM execution bridge. On a host without a D435i device and RealSense runtime, `SLI` commands can return capture errors.
@@ -197,11 +207,13 @@ ACK <OK|ERR> seq=<n> up_ms=<n> down_ms=<n> tag=<code> detail=<code_or_payload> g
 ```
 
 - Processor `tag` examples: `cfg_start`, `rt_apply`, `sli_ok`, `sli_fail`, `slam_row_ok`, `slam_row_fail`.
-- Gateway `tag` examples: `gw_bad_msg`, `gw_route_timeout`, `gw_switch`, `gw_rollback`.
+- Gateway `tag` examples: `gw_bad_msg`, `gw_route_timeout`, `gw_bad_processor_ack`, `gw_processor_seq_mismatch`, `gw_switch`, `gw_rollback`.
 - `up_ms` is computed from the command transmit timestamp when possible; otherwise it can be `0`.
 - `down_ms` is local processing/downlink time measured by the processor or parsed from processor ACK by the gateway.
+- `tag` and `detail` are emitted without whitespace so the gateway and downstream clients can parse ACK fields as whitespace-delimited `key=value` tokens.
 - `gw_trace` is the gateway-side trace identifier used for cross-layer correlation.
-- `gw_route` describes gateway routing outcome such as `forwarded`, `parse_reject`, `route_timeout`, or `mgmt`.
+- `gw_route` describes gateway routing outcome such as `forwarded`, `parse_reject`, `route_timeout`, `processor_ack_parse_error`, `processor_ack_mismatch`, or `mgmt`.
+- The gateway rejects malformed processor ACKs and ACK sequence mismatches instead of silently forwarding an uncorrelated result.
 
 ## Runtime Management
 
@@ -213,11 +225,13 @@ GW SWITCH legacy_alias=<on|off> sli_enabled=<on|off> route_timeout_ms=<1..5000>
 GW ROLLBACK
 ```
 
-Processor health command:
+Processor health command, forwarded through the gateway or sent directly to `main_processor_demo --stdio`:
 
 ```text
 HEALTH
 ```
+
+Gateway-local `GW HEALTH` reports gateway counters and routing state. Processor `HEALTH` reports core session/counter state and is returned with appended `gw_trace` / `gw_route` when sent through the gateway.
 
 Notes:
 - `GW SWITCH` is the compatibility/traffic governance switch entry used by canary migration.

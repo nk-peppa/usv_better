@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cctype>
 #include <deque>
 #include <iomanip>
 #include <iostream>
@@ -314,29 +315,33 @@ public:
     bool sendAction(ActionType action, const ControlConfig& cfg) {
         (void)cfg;
         const auto duty_pair = actionToDutyNs(action);
-        std::cout << "DOWNLINK action=" << actionToString(action)
+        std::cerr << "DOWNLINK action=" << actionToString(action)
                   << " left_duty_ns=" << duty_pair.first
                   << " right_duty_ns=" << duty_pair.second << std::endl;
         return true;
     }
 
     bool sendZero() {
-        std::cout << "DOWNLINK action=ZERO" << std::endl;
+        std::cerr << "DOWNLINK action=ZERO" << std::endl;
         return true;
     }
 
     std::string buildSlamFrame(std::uint32_t seq, const SlamOutput& output) const {
         std::ostringstream oss;
-        oss << "SL " << seq
-            << " ctrl=" << static_cast<int>(output.control_state)
-            << " status=" << static_cast<int>(output.slam_status)
-            << " quality=" << output.quality_score
-            << " proc_ms=" << output.proc_ms
-            << " source_ts=" << output.source_ts
-            << " groups=" << output.groups.size();
-        for (const std::uint32_t g : output.groups) {
-            oss << " 0x" << std::hex << std::uppercase << g << std::dec;
+        oss << "SL(seq=" << seq
+            << ",ctrl=" << static_cast<int>(output.control_state)
+            << ",status=" << static_cast<int>(output.slam_status)
+            << ",quality=" << output.quality_score
+            << ",proc_ms=" << output.proc_ms
+            << ",source_ts=" << output.source_ts
+            << ",groups=" << output.groups.size() << '[';
+        for (std::size_t i = 0; i < output.groups.size(); ++i) {
+            if (i > 0) {
+                oss << '|';
+            }
+            oss << "0x" << std::hex << std::uppercase << output.groups[i] << std::dec;
         }
+        oss << "])";
         return oss.str();
     }
 
@@ -965,33 +970,28 @@ private:
 
         SlamOutput output;
         const std::uint64_t t0 = nowMs();
-        slam_exec::D435iFrameSample capture_sample;
-        std::string capture_error;
-        const bool capture_ok = slam_executor_.CaptureD435iFrame(
-            static_cast<std::uint32_t>(session_.slam_cfg.exec_timeout_ms),
-            session_.slam_cfg,
-            &capture_sample,
-            &capture_error);
+        const ExecutorResult exec_result = slam_executor_.ProcessFrame(
+            session_.session_id,
+            cmd.frame,
+            static_cast<std::uint32_t>(session_.slam_cfg.exec_timeout_ms));
         const std::uint64_t down_ms = nowMs() - t0;
 
         output.control_state = session_.active ? 1 : 0;
-        output.proc_ms = static_cast<int>(down_ms);
+        output.proc_ms = exec_result.proc_ms > 0 ? exec_result.proc_ms : static_cast<std::uint32_t>(down_ms);
         output.source_ts = cmd.tx_ms;
-        output.quality_score = capture_ok ? 100 : 0;
-        output.groups.clear();
+        output.quality_score = exec_result.quality_score;
+        output.groups = exec_result.groups;
 
-        if (!capture_ok) {
-            output.slam_status = SlamStatus::ExecutorError;
+        if (!exec_result.ok) {
+            output.slam_status = exec_result.timeout ? SlamStatus::ExecutorTimeout : SlamStatus::ExecutorError;
             session_.slam_fusion.dropped_frames += 1;
             metrics_.sli_drop += 1;
-            if (capture_error.find("didn't arrive within") != std::string::npos ||
-                capture_error.find("timeout") != std::string::npos) {
-                output.slam_status = SlamStatus::ExecutorTimeout;
+            if (exec_result.timeout) {
                 metrics_.executor_timeout += 1;
             }
             updateSlamFusionState(cmd, output);
             return emitAck(false, cmd.seq, rx_ms, cmd.tx_ms, down_ms,
-                           fail_tag, capture_error.empty() ? "capture_error" : capture_error);
+                           fail_tag, exec_result.timeout ? "executor_timeout" : "executor_error");
         }
 
         output.slam_status = SlamStatus::Normal;
@@ -1133,9 +1133,21 @@ private:
             << " seq=" << seq
             << " up_ms=" << up_ms
             << " down_ms=" << down_ms
-            << " tag=" << tag
-            << " detail=" << detail;
+            << " tag=" << sanitizeAckValue(tag)
+            << " detail=" << sanitizeAckValue(detail);
         return oss.str();
+    }
+
+    static std::string sanitizeAckValue(const std::string& value) {
+        if (value.empty()) {
+            return "none";
+        }
+        std::string out;
+        out.reserve(value.size());
+        for (const unsigned char ch : value) {
+            out.push_back(std::isspace(ch) ? '_' : static_cast<char>(ch));
+        }
+        return out;
     }
 
     static std::uint64_t percentile(const std::deque<std::uint64_t>& samples, double p) {
@@ -1281,13 +1293,16 @@ int runD435iSelfTest() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    const bool stdio_mode = argc > 1 && std::string(argv[1]) == "--stdio";
     if (argc > 1 && std::string(argv[1]) == "--d435i-selftest") {
         return runD435iSelfTest();
     }
     ControlDownlink downlink;
     MainProcessor processor(std::move(downlink));
 
-    printUsage();
+    if (!stdio_mode) {
+        printUsage();
+    }
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line == "q" || line == "Q") {

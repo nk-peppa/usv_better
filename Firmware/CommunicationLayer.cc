@@ -1,7 +1,10 @@
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <csignal>
 #include <cstring>
 #include <deque>
 #include <iomanip>
@@ -9,7 +12,9 @@
 #include <netinet/in.h>
 #include <sstream>
 #include <string>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -48,17 +53,307 @@ struct GatewayMetrics {
     std::deque<double> ack_dl_ms_samples;
 };
 
+struct ProcessorDispatchResult {
+    bool ok = false;
+    bool timeout = false;
+    std::string ack;
+    std::string error;
+};
+
 class ProcessorClient {
 public:
-    std::string dispatch(const std::string& normalized_payload) {
-        // Placeholder for IPC dispatch to usv_control / main processor.
-        // In production, this should forward normalized_payload to MainProcessor
-        // and return its ACK in the format: ACK OK/ERR seq=... up_ms=... down_ms=... tag=... detail=...
-        // For now, returning a valid sample ACK that parseProcessorAck can handle.
-        std::ostringstream oss;
-        oss << "ACK OK seq=0 up_ms=0 down_ms=5 tag=gw_forwarded detail=placeholder";
-        return oss.str();
+    explicit ProcessorClient(std::string processor_command = defaultProcessorCommand())
+        : processor_command_(std::move(processor_command)) {
+        std::signal(SIGPIPE, SIG_IGN);
     }
+
+    ~ProcessorClient() {
+        stopChild();
+    }
+
+    ProcessorClient(const ProcessorClient&) = delete;
+    ProcessorClient& operator=(const ProcessorClient&) = delete;
+
+    ProcessorClient(ProcessorClient&& other) noexcept {
+        moveFrom(&other);
+    }
+
+    ProcessorClient& operator=(ProcessorClient&& other) noexcept {
+        if (this != &other) {
+            stopChild();
+            moveFrom(&other);
+        }
+        return *this;
+    }
+
+    ProcessorDispatchResult dispatch(const std::string& normalized_payload,
+                                     std::uint32_t timeout_ms) {
+        ProcessorDispatchResult result;
+        if (!ensureStarted(&result.error)) {
+            return result;
+        }
+
+        const std::string line = normalized_payload + "\n";
+        if (!writeAll(line, &result.error)) {
+            stopChild();
+            return result;
+        }
+
+        if (!readLine(timeout_ms, &result.ack, &result.timeout, &result.error)) {
+            if (result.timeout) {
+                // A timed-out child may later write a stale ACK and desynchronize seq alignment.
+                stopChild();
+            }
+            return result;
+        }
+
+        result.ok = true;
+        return result;
+    }
+
+    const std::string& command() const {
+        return processor_command_;
+    }
+
+    bool start(std::string* error) {
+        return ensureStarted(error);
+    }
+
+private:
+    static std::string defaultProcessorCommand() {
+        const char* env_cmd = std::getenv("USV_PROCESSOR_CMD");
+        if (env_cmd != nullptr && env_cmd[0] != '\0') {
+            return env_cmd;
+        }
+        return "./main_processor_demo --stdio";
+    }
+
+    bool ensureStarted(std::string* error) {
+        if (child_pid_ > 0) {
+            int status = 0;
+            const pid_t waited = ::waitpid(child_pid_, &status, WNOHANG);
+            if (waited == 0) {
+                return true;
+            }
+            resetFds();
+            child_pid_ = -1;
+            if (error != nullptr) {
+                *error = "processor_exited";
+            }
+        }
+
+        int stdin_pipe[2] = {-1, -1};
+        int stdout_pipe[2] = {-1, -1};
+        if (::pipe(stdin_pipe) != 0 || ::pipe(stdout_pipe) != 0) {
+            closePair(stdin_pipe);
+            closePair(stdout_pipe);
+            if (error != nullptr) {
+                *error = std::string("pipe_failed:") + std::strerror(errno);
+            }
+            return false;
+        }
+
+        const pid_t pid = ::fork();
+        if (pid < 0) {
+            closePair(stdin_pipe);
+            closePair(stdout_pipe);
+            if (error != nullptr) {
+                *error = std::string("fork_failed:") + std::strerror(errno);
+            }
+            return false;
+        }
+
+        if (pid == 0) {
+            ::dup2(stdin_pipe[0], STDIN_FILENO);
+            ::dup2(stdout_pipe[1], STDOUT_FILENO);
+            ::close(stdin_pipe[0]);
+            ::close(stdin_pipe[1]);
+            ::close(stdout_pipe[0]);
+            ::close(stdout_pipe[1]);
+            ::execl("/bin/sh", "sh", "-c", processor_command_.c_str(), static_cast<char*>(nullptr));
+            std::cerr << "exec processor failed: " << std::strerror(errno) << std::endl;
+            _exit(127);
+        }
+
+        ::close(stdin_pipe[0]);
+        ::close(stdout_pipe[1]);
+        child_pid_ = pid;
+        child_stdin_fd_ = stdin_pipe[1];
+        child_stdout_fd_ = stdout_pipe[0];
+        stdout_buffer_.clear();
+
+        // Catch immediate exec/shell failures before accepting TCP traffic.
+        ::usleep(10000);
+        int status = 0;
+        const pid_t waited = ::waitpid(child_pid_, &status, WNOHANG);
+        if (waited == child_pid_) {
+            resetFds();
+            child_pid_ = -1;
+            if (error != nullptr) {
+                *error = "processor_start_failed";
+            }
+            return false;
+        }
+        return true;
+    }
+
+    bool writeAll(const std::string& payload, std::string* error) {
+        std::size_t offset = 0;
+        while (offset < payload.size()) {
+            const ssize_t written = ::write(child_stdin_fd_, payload.data() + offset, payload.size() - offset);
+            if (written > 0) {
+                offset += static_cast<std::size_t>(written);
+                continue;
+            }
+            if (written < 0 && errno == EINTR) {
+                continue;
+            }
+            if (error != nullptr) {
+                *error = std::string("processor_write_failed:") + std::strerror(errno);
+            }
+            return false;
+        }
+        return true;
+    }
+
+    bool readLine(std::uint32_t timeout_ms,
+                  std::string* out,
+                  bool* timed_out,
+                  std::string* error) {
+        if (out == nullptr || timed_out == nullptr) {
+            return false;
+        }
+        *timed_out = false;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+        while (true) {
+            const std::size_t newline = stdout_buffer_.find('\n');
+            if (newline != std::string::npos) {
+                *out = stdout_buffer_.substr(0, newline);
+                stdout_buffer_.erase(0, newline + 1);
+                if (!out->empty() && out->back() == '\r') {
+                    out->pop_back();
+                }
+                return true;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                *timed_out = true;
+                if (error != nullptr) {
+                    *error = "processor_timeout";
+                }
+                return false;
+            }
+
+            const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+            timeval tv{};
+            tv.tv_sec = static_cast<long>(remaining.count() / 1000000);
+            tv.tv_usec = static_cast<long>(remaining.count() % 1000000);
+
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(child_stdout_fd_, &read_fds);
+            const int ready = ::select(child_stdout_fd_ + 1, &read_fds, nullptr, nullptr, &tv);
+            if (ready > 0 && FD_ISSET(child_stdout_fd_, &read_fds)) {
+                char buffer[1024];
+                const ssize_t n = ::read(child_stdout_fd_, buffer, sizeof(buffer));
+                if (n > 0) {
+                    stdout_buffer_.append(buffer, static_cast<std::size_t>(n));
+                    continue;
+                }
+                if (n == 0) {
+                    if (error != nullptr) {
+                        *error = "processor_stdout_closed";
+                    }
+                    stopChild();
+                    return false;
+                }
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (error != nullptr) {
+                    *error = std::string("processor_read_failed:") + std::strerror(errno);
+                }
+                stopChild();
+                return false;
+            }
+            if (ready == 0) {
+                *timed_out = true;
+                if (error != nullptr) {
+                    *error = "processor_timeout";
+                }
+                return false;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            if (error != nullptr) {
+                *error = std::string("processor_select_failed:") + std::strerror(errno);
+            }
+            stopChild();
+            return false;
+        }
+    }
+
+    void stopChild() {
+        const pid_t pid = child_pid_;
+        resetFds();
+        if (pid > 0) {
+            ::kill(pid, SIGTERM);
+            for (int i = 0; i < 10; ++i) {
+                int status = 0;
+                const pid_t waited = ::waitpid(pid, &status, WNOHANG);
+                if (waited == pid || waited < 0) {
+                    child_pid_ = -1;
+                    return;
+                }
+                ::usleep(10000);
+            }
+            ::kill(pid, SIGKILL);
+            int status = 0;
+            ::waitpid(pid, &status, 0);
+        }
+        child_pid_ = -1;
+    }
+
+    void resetFds() {
+        if (child_stdin_fd_ >= 0) {
+            ::close(child_stdin_fd_);
+            child_stdin_fd_ = -1;
+        }
+        if (child_stdout_fd_ >= 0) {
+            ::close(child_stdout_fd_);
+            child_stdout_fd_ = -1;
+        }
+        stdout_buffer_.clear();
+    }
+
+    static void closePair(int fds[2]) {
+        if (fds[0] >= 0) {
+            ::close(fds[0]);
+        }
+        if (fds[1] >= 0) {
+            ::close(fds[1]);
+        }
+    }
+
+    void moveFrom(ProcessorClient* other) {
+        processor_command_ = std::move(other->processor_command_);
+        child_pid_ = other->child_pid_;
+        child_stdin_fd_ = other->child_stdin_fd_;
+        child_stdout_fd_ = other->child_stdout_fd_;
+        stdout_buffer_ = std::move(other->stdout_buffer_);
+        other->child_pid_ = -1;
+        other->child_stdin_fd_ = -1;
+        other->child_stdout_fd_ = -1;
+    }
+
+    std::string processor_command_;
+    pid_t child_pid_ = -1;
+    int child_stdin_fd_ = -1;
+    int child_stdout_fd_ = -1;
+    std::string stdout_buffer_;
 };
 
 class CommunicationLayer {
@@ -95,20 +390,49 @@ public:
         }
 
         const auto route_begin = std::chrono::steady_clock::now();
-        const std::string processor_ack = processor_client_.dispatch(traced_msg.normalized_payload);
+        const ProcessorDispatchResult dispatch_result = processor_client_.dispatch(
+            traced_msg.normalized_payload, switches_.route_timeout_ms);
         const double route_ms = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - route_begin).count() / 1000.0;
-        if (route_ms > static_cast<double>(switches_.route_timeout_ms)) {
+        if (dispatch_result.timeout || route_ms > static_cast<double>(switches_.route_timeout_ms)) {
             metrics_.route_timeout += 1;
             const std::string ack = buildAck(false, traced_msg.seq, 0, 0,
-                                             "gw_route_timeout", "timeout",
+                                             "gw_route_timeout", dispatch_result.error.empty() ? "timeout" : dispatch_result.error,
                                              trace_id, "route_timeout");
             recordAck(false, 0.0);
             return ack;
         }
+        if (!dispatch_result.ok) {
+            const std::string ack = buildAck(false, traced_msg.seq, 0, 0,
+                                             "gw_processor_unavailable",
+                                             dispatch_result.error.empty() ? "dispatch_failed" : dispatch_result.error,
+                                             trace_id, "processor_dispatch_error");
+            recordAck(false, 0.0);
+            return ack;
+        }
 
-        // Parse processor ACK and append gateway context
-        ProcessorAckFields processor_fields = parseProcessorAck(processor_ack);
+        if (traced_msg.normalized_payload == "HEALTH" && startsWith(dispatch_result.ack, "HEALTH")) {
+            return dispatch_result.ack + " gw_trace=" + trace_id + " gw_route=forwarded";
+        }
+
+        // Parse processor ACK and append gateway context. The ACK seq must stay aligned with
+        // the accepted gateway frame so callers can correlate a single command end-to-end.
+        ProcessorAckFields processor_fields = parseProcessorAck(dispatch_result.ack);
+        if (!processor_fields.valid) {
+            const std::string ack = buildAck(false, traced_msg.seq, 0, 0,
+                                             "gw_bad_processor_ack", "malformed",
+                                             trace_id, "processor_ack_parse_error");
+            recordAck(false, 0.0);
+            return ack;
+        }
+        if (processor_fields.seq != traced_msg.seq) {
+            const std::string ack = buildAck(false, traced_msg.seq, processor_fields.up_ms,
+                                             processor_fields.down_ms,
+                                             "gw_processor_seq_mismatch", "processor_seq_mismatch",
+                                             trace_id, "processor_ack_mismatch");
+            recordAck(false, static_cast<double>(processor_fields.down_ms));
+            return ack;
+        }
         const std::string gw_ack = buildAck(processor_fields.ok, processor_fields.seq,
                                              processor_fields.up_ms, processor_fields.down_ms,
                                              processor_fields.tag, processor_fields.detail,
@@ -185,6 +509,12 @@ private:
         std::string mode;
         if (!(iss >> mode)) {
             msg.error = "empty";
+            return msg;
+        }
+
+        if (mode == "HEALTH") {
+            msg.normalized_payload = "HEALTH";
+            msg.valid = true;
             return msg;
         }
 
@@ -275,7 +605,8 @@ private:
             }
 
             bool has_frame_id = false;
-            bool has_size = false;
+            bool has_width = false;
+            bool has_height = false;
             std::ostringstream normalized;
             normalized << "SLI " << msg.seq << ' ' << msg.client_ts_ms;
             std::string kv;
@@ -300,11 +631,15 @@ private:
                         msg.error = "sli_bad_shape";
                         return msg;
                     }
-                    has_size = true;
+                    if (key == "width") {
+                        has_width = true;
+                    } else {
+                        has_height = true;
+                    }
                 }
                 normalized << ' ' << key << '=' << value;
             }
-            if (!has_frame_id || !has_size) {
+            if (!has_frame_id || !has_width || !has_height) {
                 msg.error = "sli_incomplete";
                 return msg;
             }
@@ -335,7 +670,8 @@ private:
             }
 
             bool has_frame_id = false;
-            bool has_size = false;
+            bool has_width = false;
+            bool has_height = false;
             std::ostringstream normalized;
             normalized << "SLI " << msg.seq << ' ' << msg.client_ts_ms;
 
@@ -361,11 +697,15 @@ private:
                         msg.error = "sl_bad_shape";
                         return msg;
                     }
-                    has_size = true;
+                    if (key == "width") {
+                        has_width = true;
+                    } else {
+                        has_height = true;
+                    }
                 }
                 normalized << ' ' << key << '=' << value;
             }
-            if (!has_frame_id || !has_size) {
+            if (!has_frame_id || !has_width || !has_height) {
                 msg.error = "sl_incomplete";
                 return msg;
             }
@@ -489,6 +829,7 @@ private:
     }
 
     struct ProcessorAckFields {
+        bool valid = false;
         bool ok = false;
         std::uint32_t seq = 0;
         std::uint64_t up_ms = 0;
@@ -502,12 +843,14 @@ private:
         std::istringstream iss(ack_str);
         
         std::string ack_kw, status;
-        if (!(iss >> ack_kw >> status)) {
-            return fields;  // Invalid format
+        if (!(iss >> ack_kw >> status) || ack_kw != "ACK" ||
+            !(status == "OK" || status == "ERR")) {
+            return fields;
         }
-        
+
+        fields.valid = true;
         fields.ok = (status == "OK");
-        
+
         std::string kv;
         while (iss >> kv) {
             std::string key, value;
@@ -542,11 +885,27 @@ private:
             << " seq=" << seq
             << " up_ms=" << up_ms
             << " down_ms=" << down_ms
-            << " tag=" << tag
-            << " detail=" << detail
+            << " tag=" << sanitizeAckValue(tag)
+            << " detail=" << sanitizeAckValue(detail)
             << " gw_trace=" << gw_trace
             << " gw_route=" << gw_route;
         return oss.str();
+    }
+
+    static bool startsWith(const std::string& value, const std::string& prefix) {
+        return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+    }
+
+    static std::string sanitizeAckValue(const std::string& value) {
+        if (value.empty()) {
+            return "none";
+        }
+        std::string out;
+        out.reserve(value.size());
+        for (const unsigned char ch : value) {
+            out.push_back(std::isspace(ch) ? '_' : static_cast<char>(ch));
+        }
+        return out;
     }
 
     static double computeUplinkMs(const ParsedMessage& msg, std::uint64_t recv_ms) {
@@ -636,6 +995,8 @@ private:
                                  std::uint64_t recv_ms,
                                  const std::chrono::steady_clock::time_point& recv_tp,
                                  std::string* response) {
+        (void)recv_ms;
+        (void)recv_tp;
         if (response == nullptr) {
             return false;
         }
@@ -915,13 +1276,15 @@ int runTcpServer(CommunicationLayer* comm, std::uint16_t port) {
     }
 }
 
-void printUsage() {
+void printUsage(const std::string& processor_command) {
     std::cout << "Communication Layer (Gateway Adapter)\n"
               << "TCP listener: 0.0.0.0:" << kDefaultListenPort << " (fallback order: 19520, 9773, 11514, 23758, 52019)\n"
+              << "Processor command: " << processor_command << "\n"
+              << "Override with: USV_PROCESSOR_CMD='<cmd>' or --processor-cmd '<cmd>'\n"
               << "Line protocol: one command per line, newline-delimited over TCP\n"
               << "Realtime short frame:\n"
-              << "  R <seq> <F|L|R> [client_ts_ms]\n"
-              << "  RT <seq> <F|L|R> [client_ts_ms]  # legacy alias\n"
+              << "  R <seq> <F|L|R|S> [client_ts_ms]\n"
+              << "  RT <seq> <F|L|R|S> [client_ts_ms]  # legacy alias\n"
               << "SLAM image ingest frame:\n"
               << "  SLI <seq> <tx_ms> frame_id=<n> width=<w> height=<h> pixel_fmt=<fmt> keyframe=<0|1> quality_hint=<0..100> payload_ref=<id>\n"
               << "  SL <seq> <tx_ms> frame_id=<n> width=<w> height=<h> pixel_fmt=<fmt> keyframe=<0|1> quality_hint=<0..100> payload_ref=<id>  # legacy alias\n"
@@ -931,7 +1294,9 @@ void printUsage() {
               << "  C STOP seq=<n> ts=<ms>\n"
               << "  CE seq=<n> ts=<ms>  # legacy alias\n"
               << "ACK template:\n"
-              << "  ACK <OK|ERR> seq=<n> detail=<code> rx_ms=<n> ul_ms=<n> dl_ms=<n> trace=<id> route=<result>\n"
+              << "  ACK <OK|ERR> seq=<n> up_ms=<n> down_ms=<n> tag=<code> detail=<code_or_payload> gw_trace=<id> gw_route=<result>\n"
+              << "Processor health:\n"
+              << "  HEALTH\n"
               << "Gateway management:\n"
               << "  GW HEALTH\n"
               << "  GW SWITCH legacy_alias=<on|off> sli_enabled=<on|off> route_timeout_ms=<1..5000>\n"
@@ -942,10 +1307,31 @@ void printUsage() {
 
 }  // namespace
 
-int main() {
-    ProcessorClient processor_client;
+int main(int argc, char** argv) {
+    std::string processor_command;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--processor-cmd" && i + 1 < argc) {
+            processor_command = argv[++i];
+        } else if (arg.rfind("--processor-cmd=", 0) == 0) {
+            processor_command = arg.substr(std::string("--processor-cmd=").size());
+        } else {
+            std::cerr << "unknown argument: " << arg << std::endl;
+            return 2;
+        }
+    }
+
+    ProcessorClient processor_client(
+        processor_command.empty() ? ProcessorClient{} : ProcessorClient(std::move(processor_command)));
+    const std::string command_label = processor_client.command();
+    std::string processor_error;
+    if (!processor_client.start(&processor_error)) {
+        std::cerr << "failed to start processor command '" << command_label
+                  << "': " << processor_error << std::endl;
+        return 3;
+    }
     CommunicationLayer comm(std::move(processor_client));
 
-    printUsage();
+    printUsage(command_label);
     return runTcpServer(&comm, kDefaultListenPort);
 }
