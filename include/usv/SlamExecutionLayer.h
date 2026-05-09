@@ -68,6 +68,8 @@ struct ExecutorResult {
     std::vector<int> row_indices;
     std::vector<std::uint8_t> r_values;
     std::vector<std::uint16_t> depth_values;
+    bool imu_gyro_valid = false;
+    std::uint32_t imu_gyro_frames = 0;
     float imu_gyro_x = 0.0f;
     float imu_gyro_y = 0.0f;
     float imu_gyro_z = 0.0f;
@@ -86,6 +88,8 @@ struct D435iFrameSample {
     std::vector<int> row_indices;
     std::vector<std::uint8_t> rgb_row;
     std::vector<std::uint16_t> depth_row;
+    bool gyro_valid = false;
+    std::uint32_t gyro_frame_count = 0;
     float gyro_x = 0.0f;
     float gyro_y = 0.0f;
     float gyro_z = 0.0f;

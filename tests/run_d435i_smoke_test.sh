@@ -6,7 +6,10 @@ BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build}"
 BIN_DIR="${BIN_DIR:-${BUILD_DIR}/bin}"
 TEST_BIN="${BIN_DIR}/SelD435iSmokeTest"
 
-if [[ ! -x "${TEST_BIN}" ]]; then
+if [[ ! -x "${TEST_BIN}" \
+      || "${ROOT_DIR}/tests/SelD435iSmokeTest.cc" -nt "${TEST_BIN}" \
+      || "${ROOT_DIR}/src/SlamExecutionLayer.cc" -nt "${TEST_BIN}" \
+      || "${ROOT_DIR}/include/usv/SlamExecutionLayer.h" -nt "${TEST_BIN}" ]]; then
   mkdir -p "${BIN_DIR}"
 
   REALSENSE_INCLUDE="${REALSENSE_INCLUDE:-}"

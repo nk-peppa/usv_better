@@ -120,6 +120,8 @@ struct SlamOutput {
     std::vector<int> row_indices;
     std::vector<std::uint8_t> r_values;
     std::vector<std::uint16_t> depth_values;
+    bool imu_gyro_valid = false;
+    std::uint32_t imu_gyro_frames = 0;
     float imu_gyro_x = 0.0f;
     float imu_gyro_y = 0.0f;
     float imu_gyro_z = 0.0f;
@@ -179,6 +181,8 @@ struct ExecutorResult {
     std::vector<int> row_indices;
     std::vector<std::uint8_t> r_values;
     std::vector<std::uint16_t> depth_values;
+    bool imu_gyro_valid = false;
+    std::uint32_t imu_gyro_frames = 0;
     float imu_gyro_x = 0.0f;
     float imu_gyro_y = 0.0f;
     float imu_gyro_z = 0.0f;
@@ -338,6 +342,8 @@ private:
         out.row_indices = in.row_indices;
         out.r_values = in.r_values;
         out.depth_values = in.depth_values;
+        out.imu_gyro_valid = in.imu_gyro_valid;
+        out.imu_gyro_frames = in.imu_gyro_frames;
         out.imu_gyro_x = in.imu_gyro_x;
         out.imu_gyro_y = in.imu_gyro_y;
         out.imu_gyro_z = in.imu_gyro_z;
@@ -402,7 +408,9 @@ public:
         for (const std::uint32_t g : output.groups) {
             oss << " 0x" << std::hex << std::uppercase << g << std::dec;
         }
-        oss << " IMU_gyro=" << std::fixed << std::setprecision(4)
+        oss << " IMU_valid=" << (output.imu_gyro_valid ? 1 : 0)
+            << " IMU_frames=" << output.imu_gyro_frames
+            << " IMU_gyro=" << std::fixed << std::setprecision(4)
             << output.imu_gyro_x << ',' << output.imu_gyro_y << ',' << output.imu_gyro_z
             << std::defaultfloat;
         if (!output.depth_values.empty() && output.depth_values.size() == output.r_values.size()) {
@@ -1055,10 +1063,14 @@ private:
         if (cmd.control_cfg.soft_limit_hz <= 0.0f || cmd.control_cfg.soft_limit_hz > kHardLimitHz) {
             return emitAck(false, cmd.seq, rx_ms, cmd.tx_ms, 0, "cfg_reject", "bad_soft_hz");
         }
-        if (cmd.slam_cfg.max_fps <= 0 || cmd.slam_cfg.max_fps > kSlamHardMaxFps ||
-            cmd.slam_cfg.exec_timeout_ms <= 0 || cmd.slam_cfg.exec_timeout_ms > kSlamHardMaxTimeoutMs ||
-            cmd.slam_cfg.max_groups <= 0 || cmd.slam_cfg.max_groups > kSlamHardMaxGroups) {
-            return emitAck(false, cmd.seq, rx_ms, cmd.tx_ms, 0, "cfg_reject", "bad_slam_cfg");
+        if (cmd.slam_cfg.max_fps <= 0 || cmd.slam_cfg.max_fps > kSlamHardMaxFps) {
+            return emitAck(false, cmd.seq, rx_ms, cmd.tx_ms, 0, "cfg_reject", "bad_slam_max_fps");
+        }
+        if (cmd.slam_cfg.exec_timeout_ms <= 0 || cmd.slam_cfg.exec_timeout_ms > kSlamHardMaxTimeoutMs) {
+            return emitAck(false, cmd.seq, rx_ms, cmd.tx_ms, 0, "cfg_reject", "bad_slam_timeout_ms");
+        }
+        if (cmd.slam_cfg.max_groups <= 0 || cmd.slam_cfg.max_groups > kSlamHardMaxGroups) {
+            return emitAck(false, cmd.seq, rx_ms, cmd.tx_ms, 0, "cfg_reject", "bad_slam_max_groups");
         }
         if (cmd.slam_cfg.row_ratio < 0.0f || cmd.slam_cfg.row_ratio > 1.0f ||
             cmd.slam_cfg.sample_stride <= 0 || cmd.slam_cfg.sample_stride > kSlamHardMaxStride ||
@@ -1180,6 +1192,8 @@ private:
         output.row_indices = result.row_indices;
         output.r_values = result.r_values;
         output.depth_values = result.depth_values;
+        output.imu_gyro_valid = result.imu_gyro_valid;
+        output.imu_gyro_frames = result.imu_gyro_frames;
         output.imu_gyro_x = result.imu_gyro_x;
         output.imu_gyro_y = result.imu_gyro_y;
         output.imu_gyro_z = result.imu_gyro_z;
@@ -1460,7 +1474,7 @@ private:
 
     static constexpr float kHardLimitHz = 100.0f;
     static constexpr int kSlamHardMaxFps = 30;
-    static constexpr int kSlamHardMaxTimeoutMs = 200;
+    static constexpr int kSlamHardMaxTimeoutMs = 5000;
     static constexpr int kSlamHardMaxGroups = 64;
     static constexpr int kSlamHardMaxStride = 64;
     static constexpr int kSlamHardMaxRows = 64;
@@ -1621,7 +1635,7 @@ void printUsage() {
               << "TCP processor backend:\n"
               << "  --tcp [--port 19521] [--mock-d435i]\n"
               << "Config start:\n"
-              << "  C START seq=<n> ts=<ms> soft_hz=<1..100> max_power=<v> left_gain=<v> right_gain=<v> left_trim=<v> right_trim=<v> slam_max_fps=<1..30> slam_timeout_ms=<1..200> slam_max_groups=<1..64> slam_min_quality=<0..100> slam_drop_policy=<reject|oldest|newest> row_ratio=<0..1> channel_mode=<R|G|B|GRAY> sample_stride=<1..64> max_rows=<1..64> pack_mode=<bin|hex>\n"
+              << "  C START seq=<n> ts=<ms> soft_hz=<1..100> max_power=<v> left_gain=<v> right_gain=<v> left_trim=<v> right_trim=<v> slam_max_fps=<1..30> slam_timeout_ms=<1..5000> slam_max_groups=<1..64> slam_min_quality=<0..100> slam_drop_policy=<reject|oldest|newest> row_ratio=<0..1> channel_mode=<R|G|B|GRAY> sample_stride=<1..64> max_rows=<1..64> pack_mode=<bin|hex>\n"
               << "Realtime:\n"
               << "  R <seq> <tx_ms> <F|L|R>\n"
               << "SLAM image input:\n"

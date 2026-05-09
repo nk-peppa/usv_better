@@ -53,29 +53,70 @@ std::string formatSampleLine(const slam_exec::D435iFrameSample& sample) {
     return oss.str();
 }
 
+bool parsePositiveIntArg(const std::string& value, int* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    try {
+        std::size_t consumed = 0;
+        const int parsed = std::stoi(value, &consumed);
+        if (consumed != value.size() || parsed <= 0) {
+            return false;
+        }
+        *out = parsed;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     constexpr std::uint32_t kSessionId = 1u;
     constexpr std::uint32_t kConfigVersion = 1u;
-    constexpr int kRunSeconds = 10;
-    const int max_fps = 10;
-    const std::uint32_t exec_timeout_ms = 60u;
+    int run_seconds = 10;
+    int max_fps = 10;
+    int exec_timeout_ms_arg = 1000;
     const float row_ratio = 0.333333f;
     const int sample_stride = 1;
 
     SlamConfig cfg;
-    cfg.max_fps = max_fps;
-    cfg.exec_timeout_ms = static_cast<int>(exec_timeout_ms);
     cfg.row_ratio = row_ratio;
     cfg.sample_stride = sample_stride;
 
     bool use_mock = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "+mock" || std::string(argv[i]) == "--mock") {
+        const std::string arg = argv[i];
+        if (arg == "+mock" || arg == "--mock") {
             use_mock = true;
+        } else if (arg == "--timeout-ms" && i + 1 < argc) {
+            if (!parsePositiveIntArg(argv[++i], &exec_timeout_ms_arg)) {
+                std::cerr << "Bad --timeout-ms value" << std::endl;
+                return 64;
+            }
+        } else if (arg == "--seconds" && i + 1 < argc) {
+            if (!parsePositiveIntArg(argv[++i], &run_seconds)) {
+                std::cerr << "Bad --seconds value" << std::endl;
+                return 64;
+            }
+        } else if (arg == "--fps" && i + 1 < argc) {
+            if (!parsePositiveIntArg(argv[++i], &max_fps)) {
+                std::cerr << "Bad --fps value" << std::endl;
+                return 64;
+            }
+        } else if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: SelD435iSmokeTest [--mock] [--timeout-ms N] [--seconds N] [--fps N]\n";
+            return 0;
+        } else {
+            std::cerr << "Unknown argument: " << arg << std::endl;
+            return 64;
         }
     }
+
+    const std::uint32_t exec_timeout_ms = static_cast<std::uint32_t>(exec_timeout_ms_arg);
+    cfg.max_fps = max_fps;
+    cfg.exec_timeout_ms = exec_timeout_ms_arg;
 
     SlamExecutionLayerClient client;
     client.EnableMockD435i(use_mock);
@@ -91,7 +132,7 @@ int main(int argc, char** argv) {
     }
 
     const std::uint64_t start_ms = nowMs();
-    const std::uint64_t end_ms = start_ms + static_cast<std::uint64_t>(kRunSeconds * 1000);
+    const std::uint64_t end_ms = start_ms + static_cast<std::uint64_t>(run_seconds * 1000);
     const std::uint32_t frame_interval_ms = static_cast<std::uint32_t>(1000 / max_fps);
 
     std::uint32_t sent = 0;
@@ -157,12 +198,14 @@ int main(int argc, char** argv) {
     const double avg_capture_ms = sent > 0 ? static_cast<double>(capture_ms_total) / static_cast<double>(sent) : 0.0;
     const double ready_rate = sent > 0 ? (100.0 * static_cast<double>(ready_true) / static_cast<double>(sent)) : 0.0;
 
-    std::cout << "\n=== SEL 10s D435i smoke test ===\n";
+    std::cout << "\n=== SEL D435i smoke test ===\n";
     std::cout << "sent=" << sent
               << " ok=" << ok
               << " timeout=" << timeout
               << " err=" << err
               << " capture_err=" << capture_err
+              << " timeout_ms=" << exec_timeout_ms
+              << " seconds=" << run_seconds
               << " ready_rate=" << ready_rate << "%"
               << " avg_capture_ms=" << avg_capture_ms
               << " max_capture_ms=" << capture_ms_max
