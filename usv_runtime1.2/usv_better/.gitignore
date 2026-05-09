@@ -1,0 +1,34 @@
+# Build artifacts
+/build/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+install_manifest.txt
+
+# Generated binaries from legacy/manual builds
+/CommunicationLayer
+/MainProcessor
+/ThrusterActuator
+/SelD435iSmokeTest
+/communication_layer_demo
+/main_processor_demo
+/thruster_actuator_demo
+/thruster_demo
+/thruster_process_layer_demo
+/truster_actuator_demo
+/sel_d435i_smoke
+
+# Logs and local files
+*.log
+wlan_watchdog.log
+sel_smoke_5s.log
+sel_smoke_revert.log
+wlan_watchdog.sh
+SYSTEM_DESIGN.md
+GLOBAL_READINESS.md
+
+# Editor files
+.vscode/launch.json
+.vscode/tasks.json
