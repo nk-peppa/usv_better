@@ -102,11 +102,21 @@ int main() {
 
         for (int i = 0; i < 6; ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            std::lock_guard<std::mutex> lock(value_mutex);
+            float sample_x = 0.0f;
+            float sample_y = 0.0f;
+            float sample_z = 0.0f;
+            float sample_max_abs = 0.0f;
+            {
+                std::lock_guard<std::mutex> lock(value_mutex);
+                sample_x = last_x;
+                sample_y = last_y;
+                sample_z = last_z;
+                sample_max_abs = max_abs;
+            }
             std::cout << "t=" << (i + 1)
                       << " gyro_count=" << gyro_count.load()
-                      << " last=" << last_x << "," << last_y << "," << last_z
-                      << " max_abs=" << max_abs
+                      << " last=" << sample_x << "," << sample_y << "," << sample_z
+                      << " max_abs=" << sample_max_abs
                       << std::endl;
         }
 

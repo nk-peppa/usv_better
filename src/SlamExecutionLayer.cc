@@ -103,7 +103,12 @@ cv::Mat buildRedMaskFromBgr(const std::uint8_t* bgr_bytes,
                             int width,
                             int height,
                             int stride_bytes) {
-    cv::Mat bgr(height, width, CV_8UC3, const_cast<std::uint8_t*>(bgr_bytes), stride_bytes);
+    cv::Mat bgr(height, width, CV_8UC3);
+    for (int y = 0; y < height; ++y) {
+        const std::uint8_t* src = bgr_bytes + static_cast<std::ptrdiff_t>(y) * stride_bytes;
+        std::uint8_t* dst = bgr.ptr<std::uint8_t>(y);
+        std::memcpy(dst, src, static_cast<std::size_t>(width) * 3u);
+    }
     cv::Mat hsv;
     cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
 
@@ -202,9 +207,6 @@ public:
 
         try {
             rs2::frameset frames;
-            if (align_to_color_ == nullptr) {
-                align_to_color_ = std::make_unique<rs2::align>(RS2_STREAM_COLOR);
-            }
             if (!pipeline_.poll_for_frames(&frames)) {
                 frames = pipeline_.wait_for_frames(timeout_ms);
             }
@@ -265,14 +267,16 @@ public:
             out->depth_row.reserve(row_indices.size() * samples_per_row);
             {
                 std::lock_guard<std::mutex> lock(imu_mutex_);
-                out->gyro_valid = gyro_frame_count_ > 0;
-                out->gyro_frame_count = gyro_frame_count_;
+                const std::uint32_t gyro_frames = gyro_frame_count_;
+                out->gyro_frame_count = gyro_frames;
+                out->gyro_valid = gyro_frames > 0;
                 out->gyro_x = last_gyro_x_;
                 out->gyro_y = last_gyro_y_;
                 out->gyro_z = last_gyro_z_;
             }
 
             for (const int row_index : row_indices) {
+                const std::uint8_t* mask_row = red_mask.ptr<std::uint8_t>(row_index);
                 for (int x = 0; x < sample_limit; x += stride) {
                     const int color_offset = row_index * color_stride_bytes + x * 3;
                     const std::uint8_t b = color_bytes[color_offset + 0];
@@ -281,7 +285,7 @@ public:
                     out->rgb_row.push_back(r);
                     out->rgb_row.push_back(g);
                     out->rgb_row.push_back(b);
-                    out->red_mask_row.push_back(red_mask.at<std::uint8_t>(row_index, x));
+                    out->red_mask_row.push_back(mask_row[x]);
 
                     const int depth_offset = row_index * depth_stride_words + x;
                     out->depth_row.push_back(depth_words[depth_offset]);
@@ -323,10 +327,7 @@ private:
                 }
             }
 
-            bool has_gyro = false;
-            for (const rs2::stream_profile& profile : motion_profiles) {
-                has_gyro = has_gyro || profile.stream_type() == RS2_STREAM_GYRO;
-            }
+            const bool has_gyro = !motion_profiles.empty();
             if (!has_gyro) {
                 continue;
             }
