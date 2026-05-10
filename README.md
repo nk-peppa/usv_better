@@ -59,6 +59,7 @@ usv_better/
     usv/
       SlamExecutionLayer.h
   tools/
+    D435iImuProbe.cc
     ThrusterActuator_test_runner.sh
     thruster_test_runner.sh
   scripts/
@@ -84,7 +85,8 @@ The normal CMake build creates these executables in `build/bin/`:
 - `ThrusterActuator`
 
 `SelD435iSmokeTest` is intentionally outside the normal build sequence. Run it
-through the test launcher, which compiles the executable only if it is missing:
+through the test launcher, which compiles the executable when it is missing or
+when related source files change:
 
 ```bash
 bash tests/run_d435i_smoke_test.sh --mock

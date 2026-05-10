@@ -119,7 +119,10 @@ struct SlamOutput {
     std::vector<std::uint32_t> groups;
     std::vector<int> row_indices;
     std::vector<std::uint8_t> r_values;
+    std::vector<std::uint8_t> mask_values;
     std::vector<std::uint16_t> depth_values;
+    bool imu_gyro_valid = false;
+    std::uint32_t imu_gyro_frames = 0;
     float imu_gyro_x = 0.0f;
     float imu_gyro_y = 0.0f;
     float imu_gyro_z = 0.0f;
@@ -178,7 +181,10 @@ struct ExecutorResult {
     std::vector<std::uint32_t> groups;
     std::vector<int> row_indices;
     std::vector<std::uint8_t> r_values;
+    std::vector<std::uint8_t> mask_values;
     std::vector<std::uint16_t> depth_values;
+    bool imu_gyro_valid = false;
+    std::uint32_t imu_gyro_frames = 0;
     float imu_gyro_x = 0.0f;
     float imu_gyro_y = 0.0f;
     float imu_gyro_z = 0.0f;
@@ -337,7 +343,10 @@ private:
         out.groups = in.groups;
         out.row_indices = in.row_indices;
         out.r_values = in.r_values;
+        out.mask_values = in.mask_values;
         out.depth_values = in.depth_values;
+        out.imu_gyro_valid = in.imu_gyro_valid;
+        out.imu_gyro_frames = in.imu_gyro_frames;
         out.imu_gyro_x = in.imu_gyro_x;
         out.imu_gyro_y = in.imu_gyro_y;
         out.imu_gyro_z = in.imu_gyro_z;
@@ -402,7 +411,9 @@ public:
         for (const std::uint32_t g : output.groups) {
             oss << " 0x" << std::hex << std::uppercase << g << std::dec;
         }
-        oss << " IMU_gyro=" << std::fixed << std::setprecision(4)
+        oss << " IMU_valid=" << (output.imu_gyro_valid ? 1 : 0)
+            << " IMU_frames=" << output.imu_gyro_frames
+            << " IMU_gyro=" << std::fixed << std::setprecision(4)
             << output.imu_gyro_x << ',' << output.imu_gyro_y << ',' << output.imu_gyro_z
             << std::defaultfloat;
         if (!output.depth_values.empty() && output.depth_values.size() == output.r_values.size()) {
@@ -421,6 +432,15 @@ public:
                     oss << ',';
                 }
                 oss << output.depth_values[i];
+            }
+            if (output.mask_values.size() == output.r_values.size()) {
+                oss << " mask=";
+                for (std::size_t i = 0; i < output.mask_values.size(); ++i) {
+                    if (i > 0) {
+                        oss << ',';
+                    }
+                    oss << static_cast<int>(output.mask_values[i]);
+                }
             }
         }
         return oss.str();
@@ -1055,10 +1075,14 @@ private:
         if (cmd.control_cfg.soft_limit_hz <= 0.0f || cmd.control_cfg.soft_limit_hz > kHardLimitHz) {
             return emitAck(false, cmd.seq, rx_ms, cmd.tx_ms, 0, "cfg_reject", "bad_soft_hz");
         }
-        if (cmd.slam_cfg.max_fps <= 0 || cmd.slam_cfg.max_fps > kSlamHardMaxFps ||
-            cmd.slam_cfg.exec_timeout_ms <= 0 || cmd.slam_cfg.exec_timeout_ms > kSlamHardMaxTimeoutMs ||
-            cmd.slam_cfg.max_groups <= 0 || cmd.slam_cfg.max_groups > kSlamHardMaxGroups) {
-            return emitAck(false, cmd.seq, rx_ms, cmd.tx_ms, 0, "cfg_reject", "bad_slam_cfg");
+        if (cmd.slam_cfg.max_fps <= 0 || cmd.slam_cfg.max_fps > kSlamHardMaxFps) {
+            return emitAck(false, cmd.seq, rx_ms, cmd.tx_ms, 0, "cfg_reject", "bad_slam_max_fps");
+        }
+        if (cmd.slam_cfg.exec_timeout_ms <= 0 || cmd.slam_cfg.exec_timeout_ms > kSlamHardMaxTimeoutMs) {
+            return emitAck(false, cmd.seq, rx_ms, cmd.tx_ms, 0, "cfg_reject", "bad_slam_timeout_ms");
+        }
+        if (cmd.slam_cfg.max_groups <= 0 || cmd.slam_cfg.max_groups > kSlamHardMaxGroups) {
+            return emitAck(false, cmd.seq, rx_ms, cmd.tx_ms, 0, "cfg_reject", "bad_slam_max_groups");
         }
         if (cmd.slam_cfg.row_ratio < 0.0f || cmd.slam_cfg.row_ratio > 1.0f ||
             cmd.slam_cfg.sample_stride <= 0 || cmd.slam_cfg.sample_stride > kSlamHardMaxStride ||
@@ -1179,7 +1203,10 @@ private:
         output.groups = result.groups;
         output.row_indices = result.row_indices;
         output.r_values = result.r_values;
+        output.mask_values = result.mask_values;
         output.depth_values = result.depth_values;
+        output.imu_gyro_valid = result.imu_gyro_valid;
+        output.imu_gyro_frames = result.imu_gyro_frames;
         output.imu_gyro_x = result.imu_gyro_x;
         output.imu_gyro_y = result.imu_gyro_y;
         output.imu_gyro_z = result.imu_gyro_z;

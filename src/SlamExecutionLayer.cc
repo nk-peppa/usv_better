@@ -10,6 +10,7 @@
 #include <iostream>
 #include <optional>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -17,6 +18,8 @@
 #include <vector>
 
 #include <librealsense2/rs.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 
 namespace slam_exec {
 namespace {
@@ -96,6 +99,24 @@ std::uint16_t meanDepth(const std::vector<std::uint16_t>& depths) {
     return static_cast<std::uint16_t>(sum / depths.size());
 }
 
+cv::Mat buildRedMaskFromBgr(const std::uint8_t* bgr_bytes,
+                            int width,
+                            int height,
+                            int stride_bytes) {
+    cv::Mat bgr(height, width, CV_8UC3, const_cast<std::uint8_t*>(bgr_bytes), stride_bytes);
+    cv::Mat hsv;
+    cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
+
+    cv::Mat mask_low;
+    cv::Mat mask_high;
+    cv::inRange(hsv, cv::Scalar(0, 120, 50), cv::Scalar(10, 255, 255), mask_low);
+    cv::inRange(hsv, cv::Scalar(170, 120, 50), cv::Scalar(179, 255, 255), mask_high);
+
+    cv::Mat mask;
+    cv::bitwise_or(mask_low, mask_high, mask);
+    return mask;
+}
+
 class D435iCaptureBridge {
 public:
     bool ensureStarted(std::string* error) {
@@ -103,29 +124,56 @@ public:
             return true;
         }
 
-        try {
-            rs2::config config;
-            config.enable_stream(RS2_STREAM_COLOR, 640, 480, RS2_FORMAT_BGR8, 30);
-            config.enable_stream(RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16, 30);
-            config.enable_stream(RS2_STREAM_GYRO, RS2_FORMAT_MOTION_XYZ32F, 200);
-            config.enable_stream(RS2_STREAM_ACCEL, RS2_FORMAT_MOTION_XYZ32F, 63);
+        struct VideoProfile {
+            int width;
+            int height;
+            int fps;
+        };
 
-            pipeline_profile_ = pipeline_.start(config);
-            align_to_color_ = std::make_unique<rs2::align>(RS2_STREAM_COLOR);
-            started_ = true;
-            last_error_.clear();
-            return true;
-        } catch (const rs2::error& e) {
-            last_error_ = e.what();
-            if (error != nullptr) {
-                *error = last_error_;
+        constexpr VideoProfile kProfiles[] = {
+            {424, 240, 15},
+            {640, 480, 15},
+            {640, 480, 30},
+        };
+
+        std::string last_error;
+        for (const VideoProfile& profile : kProfiles) {
+            try {
+                rs2::config config;
+                config.enable_stream(RS2_STREAM_COLOR, profile.width, profile.height, RS2_FORMAT_BGR8, profile.fps);
+                config.enable_stream(RS2_STREAM_DEPTH, profile.width, profile.height, RS2_FORMAT_Z16, profile.fps);
+
+                pipeline_profile_ = pipeline_.start(config);
+                align_to_color_ = std::make_unique<rs2::align>(RS2_STREAM_COLOR);
+                started_ = true;
+                const bool imu_started = startMotionSensor(pipeline_profile_.get_device());
+                last_error_.clear();
+                std::cout << "D435i video stream started "
+                          << profile.width << "x" << profile.height
+                          << "@" << profile.fps
+                          << " imu=" << (imu_started ? "on" : "off")
+                          << " gyro=200" << std::endl;
+                return true;
+            } catch (const rs2::error& e) {
+                last_error = e.what();
+                try {
+                    pipeline_.stop();
+                } catch (...) {
+                }
+                align_to_color_.reset();
+                started_ = false;
             }
-            started_ = false;
-            return false;
         }
+
+        last_error_ = last_error.empty() ? "d435i_no_supported_video_profile" : last_error;
+        if (error != nullptr) {
+            *error = last_error_;
+        }
+        return false;
     }
 
     void shutdown() {
+        stopMotionSensor();
         if (started_) {
             try {
                 pipeline_.stop();
@@ -154,6 +202,9 @@ public:
 
         try {
             rs2::frameset frames;
+            if (align_to_color_ == nullptr) {
+                align_to_color_ = std::make_unique<rs2::align>(RS2_STREAM_COLOR);
+            }
             if (!pipeline_.poll_for_frames(&frames)) {
                 frames = pipeline_.wait_for_frames(timeout_ms);
             }
@@ -161,28 +212,19 @@ public:
             while (pipeline_.poll_for_frames(&newer_frames)) {
                 frames = newer_frames;
             }
-            if (align_to_color_ == nullptr) {
-                align_to_color_ = std::make_unique<rs2::align>(RS2_STREAM_COLOR);
-            }
-
-            const rs2::frame gyro_frame = frames.first_or_default(RS2_STREAM_GYRO);
-            if (gyro_frame) {
-                const auto motion = gyro_frame.as<rs2::motion_frame>().get_motion_data();
-                last_gyro_x_ = motion.x;
-                last_gyro_y_ = motion.y;
-                last_gyro_z_ = motion.z;
-            }
 
             const rs2::frameset aligned = align_to_color_->process(frames);
-            const rs2::video_frame color = aligned.get_color_frame();
-            const rs2::depth_frame depth = aligned.get_depth_frame();
-            if (!color || !depth) {
+            const rs2::frame color_frame = aligned.get_color_frame();
+            const rs2::frame depth_frame = aligned.get_depth_frame();
+            if (!color_frame || !depth_frame) {
                 if (error != nullptr) {
                     *error = "missing_color_or_depth_frame";
                 }
                 return false;
             }
 
+            const rs2::video_frame color(color_frame);
+            const rs2::depth_frame depth(depth_frame);
             const int color_width = color.get_width();
             const int color_height = color.get_height();
             const int depth_width = depth.get_width();
@@ -202,6 +244,7 @@ public:
             const int depth_stride_words = depth.get_stride_in_bytes() / static_cast<int>(sizeof(std::uint16_t));
             const int sample_limit = std::min(color_width, depth_width);
             const std::size_t samples_per_row = static_cast<std::size_t>((sample_limit + stride - 1) / stride);
+            const cv::Mat red_mask = buildRedMaskFromBgr(color_bytes, color_width, color_height, color_stride_bytes);
 
             out->valid = true;
             out->capture_ts_ms = static_cast<std::uint64_t>(
@@ -215,12 +258,19 @@ public:
             out->row_index = row_indices.empty() ? 0 : row_indices.front();
             out->row_indices = row_indices;
             out->rgb_row.clear();
+            out->red_mask_row.clear();
             out->depth_row.clear();
             out->rgb_row.reserve(row_indices.size() * samples_per_row * 3u);
+            out->red_mask_row.reserve(row_indices.size() * samples_per_row);
             out->depth_row.reserve(row_indices.size() * samples_per_row);
-            out->gyro_x = last_gyro_x_;
-            out->gyro_y = last_gyro_y_;
-            out->gyro_z = last_gyro_z_;
+            {
+                std::lock_guard<std::mutex> lock(imu_mutex_);
+                out->gyro_valid = gyro_frame_count_ > 0;
+                out->gyro_frame_count = gyro_frame_count_;
+                out->gyro_x = last_gyro_x_;
+                out->gyro_y = last_gyro_y_;
+                out->gyro_z = last_gyro_z_;
+            }
 
             for (const int row_index : row_indices) {
                 for (int x = 0; x < sample_limit; x += stride) {
@@ -231,6 +281,7 @@ public:
                     out->rgb_row.push_back(r);
                     out->rgb_row.push_back(g);
                     out->rgb_row.push_back(b);
+                    out->red_mask_row.push_back(red_mask.at<std::uint8_t>(row_index, x));
 
                     const int depth_offset = row_index * depth_stride_words + x;
                     out->depth_row.push_back(depth_words[depth_offset]);
@@ -256,14 +307,81 @@ public:
     }
 
 private:
+    bool startMotionSensor(const rs2::device& device) {
+        if (motion_started_) {
+            return true;
+        }
+
+        for (const rs2::sensor& sensor : device.query_sensors()) {
+            std::vector<rs2::stream_profile> motion_profiles;
+            for (const rs2::stream_profile& profile : sensor.get_stream_profiles()) {
+                const rs2_stream stream = profile.stream_type();
+                if (stream == RS2_STREAM_GYRO && profile.format() == RS2_FORMAT_MOTION_XYZ32F) {
+                    if (profile.fps() == 200) {
+                        motion_profiles.push_back(profile);
+                    }
+                }
+            }
+
+            bool has_gyro = false;
+            for (const rs2::stream_profile& profile : motion_profiles) {
+                has_gyro = has_gyro || profile.stream_type() == RS2_STREAM_GYRO;
+            }
+            if (!has_gyro) {
+                continue;
+            }
+
+            try {
+                motion_sensor_ = std::make_unique<rs2::sensor>(sensor);
+                motion_sensor_->open(motion_profiles);
+                motion_sensor_->start([this](rs2::frame frame) {
+                    if (!frame || !frame.is<rs2::motion_frame>() ||
+                        frame.get_profile().stream_type() != RS2_STREAM_GYRO) {
+                        return;
+                    }
+                    const auto motion = frame.as<rs2::motion_frame>().get_motion_data();
+                    std::lock_guard<std::mutex> lock(imu_mutex_);
+                    last_gyro_x_ = motion.x;
+                    last_gyro_y_ = motion.y;
+                    last_gyro_z_ = motion.z;
+                    ++gyro_frame_count_;
+                });
+                motion_started_ = true;
+                return true;
+            } catch (const rs2::error& e) {
+                last_error_ = e.what();
+                stopMotionSensor();
+            }
+        }
+        return false;
+    }
+
+    void stopMotionSensor() {
+        if (motion_sensor_) {
+            try {
+                if (motion_started_) {
+                    motion_sensor_->stop();
+                }
+                motion_sensor_->close();
+            } catch (...) {
+            }
+        }
+        motion_sensor_.reset();
+        motion_started_ = false;
+    }
+
     rs2::pipeline pipeline_;
     rs2::pipeline_profile pipeline_profile_;
     std::unique_ptr<rs2::align> align_to_color_;
+    std::unique_ptr<rs2::sensor> motion_sensor_;
+    std::mutex imu_mutex_;
     bool started_ = false;
+    bool motion_started_ = false;
     std::uint32_t capture_seq_ = 0;
     float last_gyro_x_ = 0.0f;
     float last_gyro_y_ = 0.0f;
     float last_gyro_z_ = 0.0f;
+    std::uint32_t gyro_frame_count_ = 0;
     std::string last_error_;
 };
 
@@ -313,11 +431,13 @@ public:
         out->row_index = row_indices.empty() ? 0 : row_indices.front();
         out->row_indices = row_indices;
         out->rgb_row.clear();
+        out->red_mask_row.clear();
         out->depth_row.clear();
 
         const int sample_limit = kWidth;
         const std::size_t samples_per_row = static_cast<std::size_t>((sample_limit + stride - 1) / stride);
         out->rgb_row.reserve(row_indices.size() * samples_per_row * 3u);
+        out->red_mask_row.reserve(row_indices.size() * samples_per_row);
         out->depth_row.reserve(row_indices.size() * samples_per_row);
         for (const int row_index : row_indices) {
             for (int x = 0; x < sample_limit; x += stride) {
@@ -327,6 +447,7 @@ public:
                 out->rgb_row.push_back(r);
                 out->rgb_row.push_back(g);
                 out->rgb_row.push_back(b);
+                out->red_mask_row.push_back(r > 200 ? 255 : 0);
 
                 const std::uint16_t depth = static_cast<std::uint16_t>(
                     800u + ((static_cast<std::uint32_t>(x + row_index) * 3u + static_cast<std::uint32_t>(wave) * 17u) % 2200u));
@@ -334,6 +455,8 @@ public:
             }
         }
 
+        out->gyro_valid = true;
+        out->gyro_frame_count = capture_seq_;
         out->gyro_x = 0.01f * static_cast<float>(wave);
         out->gyro_y = 0.02f * static_cast<float>(wave - 16);
         out->gyro_z = 0.03f * static_cast<float>(32 - wave);
@@ -452,11 +575,14 @@ struct SlamExecutionLayerClient::Impl {
             : static_cast<std::uint32_t>(feature_bytes.size());
         result.row_indices = live_sample.row_indices;
         result.depth_values = live_sample.depth_row;
+        result.imu_gyro_valid = live_sample.gyro_valid;
+        result.imu_gyro_frames = live_sample.gyro_frame_count;
         result.imu_gyro_x = live_sample.gyro_x;
         result.imu_gyro_y = live_sample.gyro_y;
         result.imu_gyro_z = live_sample.gyro_z;
         result.r_values.clear();
         result.r_values.reserve(live_sample.rgb_row.size() / 3u);
+        result.mask_values = live_sample.red_mask_row;
         for (std::size_t i = 0; i + 2u < live_sample.rgb_row.size(); i += 3u) {
             result.r_values.push_back(live_sample.rgb_row[i]);
         }

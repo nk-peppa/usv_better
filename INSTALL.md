@@ -2,13 +2,13 @@
 
 ## Required Tools
 
-Install a C++17 compiler, CMake, and Intel RealSense development files.
+Install a C++17 compiler, CMake, OpenCV (core + imgproc), and Intel RealSense development files.
 
 On Debian/Ubuntu-style systems, the build tools are typically installed with:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential cmake
+sudo apt install -y build-essential cmake libopencv-dev
 ```
 
 Install Intel RealSense according to the target platform's RealSense setup

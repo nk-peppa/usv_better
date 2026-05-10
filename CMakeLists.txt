@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 find_package(Threads REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc)
 
 find_path(REALSENSE2_INCLUDE_DIR
   NAMES librealsense2/rs.hpp
@@ -27,10 +28,12 @@ target_include_directories(usv_slam_execution
   PUBLIC
     "${PROJECT_SOURCE_DIR}/include"
     "${REALSENSE2_INCLUDE_DIR}"
+    ${OpenCV_INCLUDE_DIRS}
 )
 target_link_libraries(usv_slam_execution
   PUBLIC
     "${REALSENSE2_LIBRARY}"
+    ${OpenCV_LIBS}
 )
 target_compile_options(usv_slam_execution PRIVATE -Wall -Wextra -pedantic)
 
