@@ -178,7 +178,7 @@ def build_parser():
     parser.add_argument("--left-trim", type=float, default=0)
     parser.add_argument("--right-trim", type=float, default=0)
     parser.add_argument("--slam-max-fps", type=int, default=10)
-    parser.add_argument("--slam-timeout-ms", type=int, default=120)
+    parser.add_argument("--slam-timeout-ms", type=int, default=1000)
     parser.add_argument("--slam-max-groups", type=int, default=8)
     parser.add_argument("--slam-min-quality", type=int, default=10)
     parser.add_argument("--slam-drop-policy", default="newest", choices=("reject", "oldest", "newest"))
