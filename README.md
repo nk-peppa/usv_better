@@ -20,6 +20,8 @@ usv_better/
 		SelD435iSmokeTest.cc
 		ThrusterActuator.cc
 		tools/
+			D435iImuProbe.cc
+			run_d435i_smoke_test.sh
 			run_tcp_stack.sh
 			thruster_test_runner.sh
 			ThrusterActuator_test_runner.sh
@@ -38,6 +40,8 @@ The sibling workspace folder `usv_test/` is currently empty and not used by this
 - `tools/ThrusterActuator_test_runner.sh`: legacy interactive helper that invokes `ThrusterActuator` if present.
 - `tools/run_tcp_stack.sh`: helper to run gateway + processor together in TCP mode.
 - `tools/usv_tcp_full_flow_client.py`: TCP client for full-flow tests (interactive on Windows).
+- `tools/D435iImuProbe.cc`: D435i IMU diagnostics probe — validates gyro/accelerometer streams, checks sensor validity flags, and reports timestamp health.
+- `tools/run_d435i_smoke_test.sh`: One-shot wrapper for the D435i smoke test binary (`sel_d435i_smoke`).
 
 ## Dependencies
 - RealSense: targets that include `SlamExecutionLayer.cc` or `SlamExecutionLayer.h` link against Intel RealSense (`librealsense2`) and include `<librealsense2/rs.hpp>`.
@@ -312,6 +316,26 @@ Notes:
 - `GW ROLLBACK` applies conservative defaults immediately: `legacy_alias=on`, `sli_enabled=on`, `route_timeout_ms=80`.
 - `GW HEALTH` exposes gateway rollout SLO signals including `ack_p95_ms`, `ack_p99_ms`, timeout/drop counts, and rollback recommendation.
 - `HEALTH` exposes processor state, ACK counters/latency percentiles, SLI drops, executor timeouts, and rollback recommendation.
+
+## D435i IMU Probe Tool (`v1.2.0.000`)
+The IMU probe binary provides stand-alone diagnostics for the Intel RealSense D435i internal IMU:
+
+```bash
+g++ -std=c++17 -Wall -Wextra -pedantic tools/D435iImuProbe.cc SlamExecutionLayer.cc -lrealsense2 -o d435i_imu_probe
+./d435i_imu_probe
+```
+
+Output includes:
+- Gyro and accelerometer stream health (frame rate, drop count)
+- Per-axis validity flags with sustained-invalidity warnings
+- Timestamp delta diagnostics (drift, gaps, jitter histogram)
+- Summary pass/fail verdict suitable for CI gating
+
+### IMU Enhancement (`v1.2.0.000`)
+`SlamExecutionLayer` now tracks gyroscope sensor validity on every captured frame:
+- Invalid gyro frames are flagged and counted; sustained invalidity triggers a processor health warning.
+- Extended capture timeout range supports longer RealSense pipeline startup on constrained hardware.
+- Processor health output (`HEALTH`) includes an `imu_validity_pct` metric and gyro invalidity counters.
 
 ## Release Gates
 Block release if any condition is true:
